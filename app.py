@@ -27,6 +27,11 @@ DEFAULT_WAIT_TIMEOUT = 15
 DEFAULT_AJAX_WAIT_SECONDS = 3.0
 DEFAULT_NAVIGATION_RETRIES = 2
 DEFAULT_PAGE_LOAD_STRATEGY = "eager"
+DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/146.0.0.0 Safari/537.36"
+)
 
 URL_LOGIN = os.getenv("URL_LOGIN", DEFAULT_URL_LOGIN)
 URL_CLIENTES = os.getenv("URL_CLIENTES", DEFAULT_URL_CLIENTES)
@@ -42,6 +47,7 @@ AJAX_WAIT_SECONDS = float(os.getenv("AJAX_WAIT_SECONDS", str(DEFAULT_AJAX_WAIT_S
 NAVIGATION_RETRIES = int(os.getenv("NAVIGATION_RETRIES", str(DEFAULT_NAVIGATION_RETRIES)))
 PAGE_LOAD_STRATEGY = os.getenv("PAGE_LOAD_STRATEGY", DEFAULT_PAGE_LOAD_STRATEGY).lower()
 CHROME_EXTRA_ARGS = shlex.split(os.getenv("CHROME_EXTRA_ARGS", ""))
+USER_AGENT = os.getenv("USER_AGENT", DEFAULT_USER_AGENT)
 
 
 def ler_env_bool(nome_variavel, padrao=False):
@@ -144,11 +150,37 @@ def abrir_url(driver, url, tentativas=NAVIGATION_RETRIES, contexto="pagina"):
     raise RuntimeError(f"Nao foi possivel abrir {contexto}: {formatar_erro(ultimo_erro)}") from ultimo_erro
 
 
+def verificar_bloqueio_acesso(driver, contexto):
+    titulo = (driver.title or "").strip()
+    html = (driver.page_source or "")[:4000]
+    html_normalizado = html.lower()
+
+    indicadores = [
+        "access denied",
+        "forbidden",
+        "request blocked",
+        "cloudflare",
+        "attention required",
+        "incapsula",
+        "akamai",
+        "perimeterx",
+    ]
+
+    if titulo.lower() in {"access denied", "forbidden"} or any(indicador in html_normalizado for indicador in indicadores):
+        trecho = re.sub(r"\s+", " ", html).strip()[:500]
+        raise RuntimeError(
+            f"Acesso bloqueado ao abrir {contexto}. "
+            f"titulo={titulo!r} trecho_html={trecho!r}"
+        )
+
+
 def criar_driver_chrome():
     print(f"Iniciando o navegador (headless={'sim' if HEADLESS else 'nao'})...")
 
     options = webdriver.ChromeOptions()
     options.page_load_strategy = PAGE_LOAD_STRATEGY
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
 
     chrome_args = [
         "--disable-dev-shm-usage",
@@ -158,12 +190,14 @@ def criar_driver_chrome():
         "--disable-extensions",
         "--disable-background-networking",
         "--disable-background-timer-throttling",
+        "--disable-blink-features=AutomationControlled",
         "--disable-renderer-backgrounding",
         "--disable-features=Translate,AcceptCHFrame,MediaRouter,OptimizationHints",
         "--no-sandbox",
         "--no-zygote",
         "--window-size=1365,768",
         "--lang=pt-BR",
+        f"--user-agent={USER_AGENT}",
         "--user-data-dir=/tmp/chrome-user-data",
         "--data-path=/tmp/chrome-data",
         "--disk-cache-dir=/tmp/chrome-cache",
@@ -193,12 +227,24 @@ def criar_driver_chrome():
 
     driver = webdriver.Chrome(service=service, options=options)
     driver.set_page_load_timeout(60)
+    driver.execute_cdp_cmd(
+        "Page.addScriptToEvaluateOnNewDocument",
+        {
+            "source": """
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
+                Object.defineProperty(navigator, 'language', {get: () => 'pt-BR'});
+                Object.defineProperty(navigator, 'languages', {get: () => ['pt-BR', 'pt', 'en-US', 'en']});
+            """
+        },
+    )
     capabilities = driver.capabilities or {}
     print(
         "Sessao Chrome iniciada: "
         f"browserVersion={capabilities.get('browserVersion')!r} "
         f"platformName={capabilities.get('platformName')!r}"
     )
+    print(f"User-Agent configurado: {USER_AGENT}")
     return driver
 
 
@@ -207,6 +253,7 @@ def fazer_login(url, usuario, senha):
     wait = WebDriverWait(driver, WAIT_TIMEOUT)
 
     abrir_url(driver, url, contexto="a pagina de login")
+    verificar_bloqueio_acesso(driver, "a pagina de login")
 
     wait.until(EC.visibility_of_element_located((By.ID, "login")))
     print("Preenchendo o formulario de login...")

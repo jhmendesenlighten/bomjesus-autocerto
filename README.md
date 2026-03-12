@@ -31,6 +31,7 @@ Este projeto foi preparado para rodar na Railway como `worker` ou `cron job`.
 - `NAVIGATION_RETRIES` default `2`
 - `PAGE_LOAD_STRATEGY` default `eager`
 - `CHROME_EXTRA_ARGS` para flags extras se precisar depurar o Chromium
+- `USER_AGENT` para sobrescrever o user-agent do navegador
 
 ## Subindo na Railway
 
@@ -38,6 +39,18 @@ Este projeto foi preparado para rodar na Railway como `worker` ou `cron job`.
 2. Deixe a Railway detectar o `Dockerfile`.
 3. Configure as variaveis de ambiente usando `.env.example` como referencia.
 4. Use o comando padrao do container: `python app.py`.
+
+## Diagnostico de bloqueio
+
+Se o log mostrar `titulo='Access Denied'` ao abrir a pagina de login, o Selenium esta funcionando e o bloqueio vem do destino.
+
+As causas mais provaveis sao:
+
+- WAF/antibot detectando automacao headless
+- bloqueio do IP de saida da Railway
+- bloqueio geografico da regiao onde o container esta rodando
+
+Se isso continuar mesmo com `USER_AGENT` normal e sem erro de Chrome, a correcao deixa de ser codigo e passa a ser infraestrutura: usar outro host/IP, proxy permitido ou whitelist no sistema de destino.
 
 ## Recomendacao de execucao
 
