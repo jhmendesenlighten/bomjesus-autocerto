@@ -16,6 +16,8 @@ Este projeto foi preparado para rodar na Railway como `worker` ou `cron job`.
 - `SUPABASE_URL`
 - `SUPABASE_KEY`
 
+`env.example` e apenas modelo. Nao coloque credenciais reais nele.
+
 ## Variaveis opcionais
 
 - `TENANT_ID` default `20`
@@ -26,6 +28,9 @@ Este projeto foi preparado para rodar na Railway como `worker` ou `cron job`.
 - `WAIT_TIMEOUT` default `15`
 - `AJAX_WAIT_SECONDS` default `3`
 - `HEADLESS` default `true` na Railway
+- `NAVIGATION_RETRIES` default `2`
+- `PAGE_LOAD_STRATEGY` default `eager`
+- `CHROME_EXTRA_ARGS` para flags extras se precisar depurar o Chromium
 
 ## Subindo na Railway
 
@@ -43,6 +48,26 @@ Na interface da Railway:
 1. Abra o service.
 2. Configure a execucao agendada.
 3. Defina a frequencia conforme sua operacao.
+
+## Agendamento atual
+
+O projeto ja inclui [railway.json](D:/PUXADA%20PORTAL/BomJesus/railway.json) com:
+
+- `cronSchedule`: `0 */8 * * *`
+- `startCommand`: `python app.py`
+- `restartPolicyType`: `NEVER`
+
+Isso executa a cada 8 horas em UTC:
+
+- `00:00 UTC`
+- `08:00 UTC`
+- `16:00 UTC`
+
+No horario de Brasilia (UTC-3), isso normalmente equivale a:
+
+- `21:00`
+- `05:00`
+- `13:00`
 
 ## Teste local
 

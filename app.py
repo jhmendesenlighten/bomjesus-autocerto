@@ -1,13 +1,15 @@
 import os
 import re
+import shlex
 import shutil
+import subprocess
 import time
 
 import pandas as pd
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from selenium import webdriver
-from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
+from selenium.common.exceptions import StaleElementReferenceException, TimeoutException, WebDriverException
 from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
@@ -23,6 +25,8 @@ DEFAULT_TEXTO_CONFIRMACAO = "Lead processado via automacao"
 DEFAULT_LISTA_LEADS_CLASS = "user-list-item"
 DEFAULT_WAIT_TIMEOUT = 15
 DEFAULT_AJAX_WAIT_SECONDS = 3.0
+DEFAULT_NAVIGATION_RETRIES = 2
+DEFAULT_PAGE_LOAD_STRATEGY = "eager"
 
 URL_LOGIN = os.getenv("URL_LOGIN", DEFAULT_URL_LOGIN)
 URL_CLIENTES = os.getenv("URL_CLIENTES", DEFAULT_URL_CLIENTES)
@@ -35,6 +39,9 @@ TEXTO_CONFIRMACAO = os.getenv("TEXTO_CONFIRMACAO", DEFAULT_TEXTO_CONFIRMACAO)
 LISTA_LEADS_CLASS = os.getenv("LISTA_LEADS_CLASS", DEFAULT_LISTA_LEADS_CLASS)
 WAIT_TIMEOUT = int(os.getenv("WAIT_TIMEOUT", str(DEFAULT_WAIT_TIMEOUT)))
 AJAX_WAIT_SECONDS = float(os.getenv("AJAX_WAIT_SECONDS", str(DEFAULT_AJAX_WAIT_SECONDS)))
+NAVIGATION_RETRIES = int(os.getenv("NAVIGATION_RETRIES", str(DEFAULT_NAVIGATION_RETRIES)))
+PAGE_LOAD_STRATEGY = os.getenv("PAGE_LOAD_STRATEGY", DEFAULT_PAGE_LOAD_STRATEGY).lower()
+CHROME_EXTRA_ARGS = shlex.split(os.getenv("CHROME_EXTRA_ARGS", ""))
 
 
 def ler_env_bool(nome_variavel, padrao=False):
@@ -86,28 +93,112 @@ def encontrar_binario_chrome():
     return None
 
 
+def obter_versao_binario(caminho_binario):
+    if not caminho_binario:
+        return None
+
+    try:
+        resultado = subprocess.run(
+            [caminho_binario, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except Exception:
+        return None
+
+    saida = (resultado.stdout or resultado.stderr or "").strip()
+    return saida or None
+
+
+def formatar_erro(exc):
+    partes = [type(exc).__name__]
+    mensagem = getattr(exc, "msg", None) or str(exc).strip()
+    if mensagem:
+        partes.append(mensagem)
+
+    stacktrace = getattr(exc, "stacktrace", None)
+    if stacktrace:
+        resumo = " | ".join(str(linha).strip() for linha in stacktrace[:3])
+        if resumo:
+            partes.append(f"stacktrace={resumo}")
+
+    return " | ".join(partes)
+
+
+def abrir_url(driver, url, tentativas=NAVIGATION_RETRIES, contexto="pagina"):
+    ultimo_erro = None
+
+    for tentativa in range(1, tentativas + 1):
+        try:
+            print(f"Acessando {contexto}: {url} (tentativa {tentativa}/{tentativas})")
+            driver.get(url)
+            print(f"{contexto.capitalize()} carregada: url_atual={driver.current_url!r} titulo={driver.title!r}")
+            return
+        except Exception as exc:
+            ultimo_erro = exc
+            print(f"Falha ao abrir {contexto}: {formatar_erro(exc)}")
+            time.sleep(2)
+
+    raise RuntimeError(f"Nao foi possivel abrir {contexto}: {formatar_erro(ultimo_erro)}") from ultimo_erro
+
+
 def criar_driver_chrome():
     print(f"Iniciando o navegador (headless={'sim' if HEADLESS else 'nao'})...")
 
     options = webdriver.ChromeOptions()
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--remote-debugging-pipe")
-    options.add_argument("--window-size=1920,1080")
+    options.page_load_strategy = PAGE_LOAD_STRATEGY
+
+    chrome_args = [
+        "--disable-dev-shm-usage",
+        "--disable-gpu",
+        "--disable-setuid-sandbox",
+        "--disable-software-rasterizer",
+        "--disable-extensions",
+        "--disable-background-networking",
+        "--disable-background-timer-throttling",
+        "--disable-renderer-backgrounding",
+        "--disable-features=Translate,AcceptCHFrame,MediaRouter,OptimizationHints",
+        "--no-sandbox",
+        "--no-zygote",
+        "--window-size=1365,768",
+        "--lang=pt-BR",
+        "--user-data-dir=/tmp/chrome-user-data",
+        "--data-path=/tmp/chrome-data",
+        "--disk-cache-dir=/tmp/chrome-cache",
+    ]
 
     if HEADLESS:
-        options.add_argument("--headless=new")
+        chrome_args.append("--headless")
+
+    chrome_args.extend(CHROME_EXTRA_ARGS)
+    for arg in chrome_args:
+        options.add_argument(arg)
 
     chrome_bin = encontrar_binario_chrome()
     if chrome_bin:
         options.binary_location = chrome_bin
 
     chromedriver_path = os.getenv("CHROMEDRIVER_PATH") or shutil.which("chromedriver")
+    print(f"Chrome binario: {chrome_bin or 'nao encontrado'}")
+    print(f"Chrome versao: {obter_versao_binario(chrome_bin) or 'desconhecida'}")
+    print(f"ChromeDriver: {chromedriver_path or 'nao encontrado'}")
+    print(f"ChromeDriver versao: {obter_versao_binario(chromedriver_path) or 'desconhecida'}")
+    print(f"Page load strategy: {PAGE_LOAD_STRATEGY}")
+    if CHROME_EXTRA_ARGS:
+        print(f"Args extras do Chrome: {CHROME_EXTRA_ARGS}")
+
     service = ChromeService(executable_path=chromedriver_path) if chromedriver_path else ChromeService()
 
     driver = webdriver.Chrome(service=service, options=options)
     driver.set_page_load_timeout(60)
+    capabilities = driver.capabilities or {}
+    print(
+        "Sessao Chrome iniciada: "
+        f"browserVersion={capabilities.get('browserVersion')!r} "
+        f"platformName={capabilities.get('platformName')!r}"
+    )
     return driver
 
 
@@ -115,8 +206,7 @@ def fazer_login(url, usuario, senha):
     driver = criar_driver_chrome()
     wait = WebDriverWait(driver, WAIT_TIMEOUT)
 
-    print(f"Acessando a pagina de login: {url}")
-    driver.get(url)
+    abrir_url(driver, url, contexto="a pagina de login")
 
     wait.until(EC.visibility_of_element_located((By.ID, "login")))
     print("Preenchendo o formulario de login...")
@@ -148,7 +238,7 @@ def processar_e_coletar_leads(driver, url, tenant_id, texto_confirmacao):
     print("\n--- Buscando lista de Leads ---")
 
     def carregar_lista_leads():
-        driver.get(url)
+        abrir_url(driver, url, contexto="a lista de leads")
         wait.until(EC.presence_of_element_located((By.TAG_NAME, "body")))
         time.sleep(AJAX_WAIT_SECONDS)
         return driver.find_elements(By.CLASS_NAME, LISTA_LEADS_CLASS)
