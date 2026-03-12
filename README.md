@@ -32,6 +32,12 @@ Este projeto foi preparado para rodar na Railway como `worker` ou `cron job`.
 - `PAGE_LOAD_STRATEGY` default `eager`
 - `CHROME_EXTRA_ARGS` para flags extras se precisar depurar o Chromium
 - `USER_AGENT` para sobrescrever o user-agent do navegador
+- `EVOLUTION_REPORT_ENABLED` habilita envio de relatorio ao final
+- `EVOLUTION_API_URL` base da Evolution API
+- `EVOLUTION_API_KEY` token da Evolution API
+- `EVOLUTION_INSTANCE` nome da instancia Evolution
+- `EVOLUTION_REPORT_TO` de 1 a 3 numeros em formato internacional, separados por virgula, `;` ou quebra de linha
+- `EVOLUTION_REPORT_DELAY` delay do envio em ms
 
 ## Subindo na Railway
 
@@ -51,6 +57,12 @@ As causas mais provaveis sao:
 - bloqueio geografico da regiao onde o container esta rodando
 
 Se isso continuar mesmo com `USER_AGENT` normal e sem erro de Chrome, a correcao deixa de ser codigo e passa a ser infraestrutura: usar outro host/IP, proxy permitido ou whitelist no sistema de destino.
+
+## Relatorio via Evolution API
+
+Ao final da execucao, o script tenta enviar um resumo por texto via endpoint oficial `sendText` da Evolution API.
+
+O envio e feito apenas para os numeros configurados em `EVOLUTION_REPORT_TO`, com limite de 3 destinatarios por execucao.
 
 ## Recomendacao de execucao
 

@@ -1,15 +1,19 @@
 import os
+import json
 import re
 import shlex
 import shutil
 import subprocess
 import time
+from datetime import datetime, timezone
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 import pandas as pd
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from selenium import webdriver
-from selenium.common.exceptions import StaleElementReferenceException, TimeoutException, WebDriverException
+from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
 from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support import expected_conditions as EC
@@ -32,6 +36,7 @@ DEFAULT_USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/146.0.0.0 Safari/537.36"
 )
+DEFAULT_EVOLUTION_REPORT_DELAY = 0
 
 URL_LOGIN = os.getenv("URL_LOGIN", DEFAULT_URL_LOGIN)
 URL_CLIENTES = os.getenv("URL_CLIENTES", DEFAULT_URL_CLIENTES)
@@ -48,6 +53,11 @@ NAVIGATION_RETRIES = int(os.getenv("NAVIGATION_RETRIES", str(DEFAULT_NAVIGATION_
 PAGE_LOAD_STRATEGY = os.getenv("PAGE_LOAD_STRATEGY", DEFAULT_PAGE_LOAD_STRATEGY).lower()
 CHROME_EXTRA_ARGS = shlex.split(os.getenv("CHROME_EXTRA_ARGS", ""))
 USER_AGENT = os.getenv("USER_AGENT", DEFAULT_USER_AGENT)
+EVOLUTION_API_URL = os.getenv("EVOLUTION_API_URL")
+EVOLUTION_API_KEY = os.getenv("EVOLUTION_API_KEY")
+EVOLUTION_INSTANCE = os.getenv("EVOLUTION_INSTANCE")
+EVOLUTION_REPORT_TO = os.getenv("EVOLUTION_REPORT_TO")
+EVOLUTION_REPORT_DELAY = int(os.getenv("EVOLUTION_REPORT_DELAY", str(DEFAULT_EVOLUTION_REPORT_DELAY)))
 
 
 def ler_env_bool(nome_variavel, padrao=False):
@@ -62,6 +72,160 @@ HEADLESS = ler_env_bool(
     "HEADLESS",
     padrao=bool(os.getenv("RAILWAY_ENVIRONMENT_NAME") or os.getenv("RAILWAY_ENVIRONMENT_ID")),
 )
+EVOLUTION_REPORT_ENABLED = ler_env_bool(
+    "EVOLUTION_REPORT_ENABLED",
+    padrao=bool(EVOLUTION_API_URL and EVOLUTION_API_KEY and EVOLUTION_INSTANCE),
+)
+
+
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def formatar_timestamp(timestamp):
+    if not timestamp:
+        return "-"
+
+    return timestamp.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def normalizar_destinatario_evolution(valor):
+    if not valor:
+        return None
+
+    if "@" in valor:
+        valor = valor.split("@", 1)[0]
+
+    numero = re.sub(r"\D", "", valor)
+    return numero or None
+
+
+def obter_destinatarios_relatorio_evolution():
+    if not EVOLUTION_REPORT_TO:
+        return []
+
+    candidatos = re.split(r"[,;\n]+", EVOLUTION_REPORT_TO)
+    destinatarios = []
+
+    for candidato in candidatos:
+        numero = normalizar_destinatario_evolution(candidato)
+        if not numero or numero in destinatarios:
+            continue
+
+        destinatarios.append(numero)
+        if len(destinatarios) == 3:
+            break
+
+    return destinatarios
+
+
+def montar_url(base_url, path):
+    return f"{base_url.rstrip('/')}/{path.lstrip('/')}"
+
+
+def fazer_requisicao_json(url, method="GET", headers=None, payload=None, timeout=30):
+    body = None
+    request_headers = dict(headers or {})
+
+    if payload is not None:
+        body = json.dumps(payload).encode("utf-8")
+        request_headers.setdefault("Content-Type", "application/json")
+
+    request = Request(url=url, data=body, headers=request_headers, method=method)
+
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            response_body = response.read().decode("utf-8", errors="replace")
+            if not response_body:
+                return None
+
+            return json.loads(response_body)
+    except HTTPError as exc:
+        detalhes = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {exc.code} em {url}: {detalhes}") from exc
+    except URLError as exc:
+        raise RuntimeError(f"Falha de rede em {url}: {exc.reason}") from exc
+
+
+def obter_headers_evolution():
+    return {
+        "apikey": EVOLUTION_API_KEY,
+        "Accept": "application/json",
+    }
+
+
+def enviar_relatorio_evolution(texto_relatorio):
+    if not EVOLUTION_REPORT_ENABLED:
+        print("Relatorio Evolution desabilitado.")
+        return False
+
+    if not EVOLUTION_API_URL or not EVOLUTION_API_KEY or not EVOLUTION_INSTANCE:
+        print("Relatorio Evolution ignorado: configuracao incompleta.")
+        return False
+
+    destinatarios = obter_destinatarios_relatorio_evolution()
+    if not destinatarios:
+        print("Relatorio Evolution ignorado: defina de 1 a 3 numeros em EVOLUTION_REPORT_TO.")
+        return False
+
+    enviados = 0
+    url = montar_url(EVOLUTION_API_URL, f"/message/sendText/{EVOLUTION_INSTANCE}")
+    for destinatario in destinatarios:
+        payload = {
+            "number": destinatario,
+            "text": texto_relatorio,
+            "delay": EVOLUTION_REPORT_DELAY,
+            "linkPreview": False,
+        }
+        resposta = fazer_requisicao_json(url, method="POST", headers=obter_headers_evolution(), payload=payload)
+        status = None
+        if isinstance(resposta, dict):
+            status = resposta.get("status")
+
+        print(f"Relatorio enviado via Evolution API para {destinatario}. status={status or 'desconhecido'}")
+        enviados += 1
+
+    return enviados > 0
+
+
+def montar_relatorio_execucao(resumo_execucao):
+    ambiente = os.getenv("RAILWAY_ENVIRONMENT_NAME") or "local"
+    service_name = os.getenv("RAILWAY_SERVICE_NAME") or "BomJesus"
+    status_texto = {
+        "success": "SUCESSO",
+        "no_data": "SEM DADOS",
+        "error": "ERRO",
+    }.get(resumo_execucao.get("status"), str(resumo_execucao.get("status", "DESCONHECIDO")).upper())
+
+    linhas = [
+        f"Relatorio BomJesus [{service_name}]",
+        f"Status: {status_texto}",
+        f"Ambiente: {ambiente}",
+        f"Tenant ID: {resumo_execucao.get('tenant_id') or '-'}",
+        f"Inicio: {formatar_timestamp(resumo_execucao.get('inicio_utc'))}",
+        f"Fim: {formatar_timestamp(resumo_execucao.get('fim_utc'))}",
+        f"Duracao: {resumo_execucao.get('duracao_segundos', 0):.1f}s",
+        f"Leads detectados: {resumo_execucao.get('leads_detectados', 0)}",
+        f"Leads processados: {resumo_execucao.get('leads_processados', 0)}",
+        f"Leads ignorados: {resumo_execucao.get('leads_ignorados', 0)}",
+        f"Leads repetidos: {resumo_execucao.get('leads_repetidos', 0)}",
+        f"Erros por lead: {resumo_execucao.get('erros_lead', 0)}",
+        f"Confirmacoes enviadas: {resumo_execucao.get('confirmacoes_enviadas', 0)}",
+        f"Registros unicos: {resumo_execucao.get('registros_unicos', 0)}",
+        f"Supabase afetados: {resumo_execucao.get('supabase_registros', 0)}",
+    ]
+
+    erro = resumo_execucao.get("erro")
+    if erro:
+        linhas.append(f"Erro: {erro}")
+
+    preview = resumo_execucao.get("preview_processados") or []
+    if preview:
+        linhas.append("Preview:")
+        for item in preview[:5]:
+            linhas.append(f"- {item}")
+
+    return "\n".join(linhas)
 
 
 def validar_configuracao():
@@ -281,6 +445,14 @@ def processar_e_coletar_leads(driver, url, tenant_id, texto_confirmacao):
     assinaturas_tentadas = set()
     identificadores_tentados = set()
     lead_numero = 0
+    resumo = {
+        "leads_detectados": 0,
+        "leads_processados": 0,
+        "leads_ignorados": 0,
+        "leads_repetidos": 0,
+        "erros_lead": 0,
+        "confirmacoes_enviadas": 0,
+    }
 
     print("\n--- Buscando lista de Leads ---")
 
@@ -338,15 +510,16 @@ def processar_e_coletar_leads(driver, url, tenant_id, texto_confirmacao):
     try:
         elementos_leads = carregar_lista_leads()
         num_total_leads = len(elementos_leads)
+        resumo["leads_detectados"] = num_total_leads
 
         if num_total_leads == 0:
             print(f"Nenhum lead encontrado com a classe '{LISTA_LEADS_CLASS}'.")
-            return []
+            return [], resumo
 
         print(f"Contagem detectada: {num_total_leads} leads para processar.")
     except Exception as exc:
         print(f"Erro ao carregar a lista inicial: {exc}")
-        return []
+        return [], resumo
 
     while True:
         assinatura_atual = None
@@ -401,6 +574,7 @@ def processar_e_coletar_leads(driver, url, tenant_id, texto_confirmacao):
             if identificador_lead in identificadores_tentados:
                 print(" -> [IGNORADO] Lead repetido detectado apos recarregar a lista.")
                 assinaturas_tentadas.add(assinatura_atual)
+                resumo["leads_repetidos"] += 1
                 continue
 
             veiculo = "Nao informado"
@@ -414,6 +588,7 @@ def processar_e_coletar_leads(driver, url, tenant_id, texto_confirmacao):
                 print(" -> [IGNORADO] Dados insuficientes. O sistema nao enviara confirmacao nem salvara.")
                 assinaturas_tentadas.add(assinatura_atual)
                 identificadores_tentados.add(identificador_lead)
+                resumo["leads_ignorados"] += 1
                 continue
 
             try:
@@ -429,6 +604,7 @@ def processar_e_coletar_leads(driver, url, tenant_id, texto_confirmacao):
                 btn_salvar.click()
 
                 print(f" -> Sucesso! Mensagem '{texto_confirmacao}' enviada.")
+                resumo["confirmacoes_enviadas"] += 1
                 time.sleep(1.5)
             except TimeoutException:
                 print(" -> [ERRO DE ENVIO] Nao foi possivel encontrar os botoes de comentario.")
@@ -464,15 +640,17 @@ def processar_e_coletar_leads(driver, url, tenant_id, texto_confirmacao):
 
             assinaturas_tentadas.add(assinatura_atual)
             identificadores_tentados.add(identificador_lead)
+            resumo["leads_processados"] += 1
             print(" -> Lead finalizado e salvo na lista temporaria.")
         except Exception as exc:
             if assinatura_atual:
                 assinaturas_tentadas.add(assinatura_atual)
+            resumo["erros_lead"] += 1
             print(f"Erro no lead {numero_execucao}: {exc}")
             continue
 
     print("\n--- Processo concluido. ---")
-    return dados_coletados
+    return dados_coletados, resumo
 
 
 def salvar_no_supabase(url_db, key_db, lista_clientes):
@@ -506,35 +684,78 @@ def main():
     validar_configuracao()
 
     driver = None
+    inicio_utc = utc_now()
+    resumo_execucao = {
+        "status": "success",
+        "erro": None,
+        "tenant_id": TENANT_ID,
+        "inicio_utc": inicio_utc,
+        "fim_utc": None,
+        "duracao_segundos": 0.0,
+        "leads_detectados": 0,
+        "leads_processados": 0,
+        "leads_ignorados": 0,
+        "leads_repetidos": 0,
+        "erros_lead": 0,
+        "confirmacoes_enviadas": 0,
+        "registros_unicos": 0,
+        "supabase_registros": 0,
+        "preview_processados": [],
+    }
+
     try:
         driver = fazer_login(URL_LOGIN, USUARIO, SENHA)
         tenant_id = obter_tenant_id(driver)
+        resumo_execucao["tenant_id"] = tenant_id
 
         if not tenant_id:
+            resumo_execucao["status"] = "error"
+            resumo_execucao["erro"] = "Tenant ID ausente."
             print("Erro de tenant id.")
             return 1
 
-        dados_completos = processar_e_coletar_leads(driver, URL_CLIENTES, tenant_id, TEXTO_CONFIRMACAO)
+        dados_completos, resumo_processamento = processar_e_coletar_leads(driver, URL_CLIENTES, tenant_id, TEXTO_CONFIRMACAO)
+        resumo_execucao.update(resumo_processamento)
         if not dados_completos:
+            resumo_execucao["status"] = "no_data"
             print("\nNenhum dado valido para salvar.")
             return 0
 
         df_clientes = pd.DataFrame(dados_completos)
         df_clientes.drop_duplicates(subset=["telefone"], keep="last", inplace=True)
+        resumo_execucao["registros_unicos"] = len(df_clientes)
 
         print("\n--- Preview dos Dados ---")
         print(df_clientes[["nome", "telefone", "mensagem_enviada"]].head().to_string(index=False))
+        resumo_execucao["preview_processados"] = [
+            f"{linha.nome} ({linha.telefone})"
+            for linha in df_clientes[["nome", "telefone"]].head().itertuples(index=False)
+        ]
 
         dados_limpos = df_clientes.to_dict("records")
-        salvar_no_supabase(SUPABASE_URL, SUPABASE_KEY, dados_limpos)
+        resumo_execucao["supabase_registros"] = salvar_no_supabase(SUPABASE_URL, SUPABASE_KEY, dados_limpos)
         return 0
     except Exception as exc:
+        resumo_execucao["status"] = "error"
+        resumo_execucao["erro"] = formatar_erro(exc)
         print(f"\nErro geral: {exc}")
         return 1
     finally:
+        resumo_execucao["fim_utc"] = utc_now()
+        resumo_execucao["duracao_segundos"] = (
+            resumo_execucao["fim_utc"] - resumo_execucao["inicio_utc"]
+        ).total_seconds()
+
+        relatorio_texto = montar_relatorio_execucao(resumo_execucao)
+
         print("\nEncerrando...")
         if driver:
             driver.quit()
+
+        try:
+            enviar_relatorio_evolution(relatorio_texto)
+        except Exception as exc:
+            print(f"Falha ao enviar relatorio pela Evolution API: {exc}")
 
 
 if __name__ == "__main__":
